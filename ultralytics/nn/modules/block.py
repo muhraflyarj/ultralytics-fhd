@@ -537,38 +537,33 @@ class Bottleneck(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
     
 class BottleneckLCAM(nn.Module):
-    """Standard bottleneck with LCAM module."""
+    """Bottleneck module leveraging Lightweight Channel Attention Module (LCAM)."""
     
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5) -> None:
         """
-        Initialize a standard bottleneck module.
+        Initializes a standard bottleneck module augmented with LCAM.
 
         Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            shortcut (bool): Whether to use shortcut connection.
-            g (int): Groups for convolutions.
-            k (Tuple[int, int]): Kernel sizes for convolutions.
-            e (float): Expansion ratio.
+            c1 (int): Input channel dimensionality.
+            c2 (int): Output channel dimensionality.
+            shortcut (bool, optional): Whether to use shortcut connections. Defaults to True.
+            g (int, optional): Number of groups for convolutions. Defaults to 1.
+            k (tuple[int, int], optional): Kernel sizes for both convolutions. Defaults to (3, 3).
+            e (float, optional): Expansion ratio for the hidden channels. Defaults to 0.5.
         """
         super().__init__()
-        c_ = int(c2 * e)  # hidden channels
+        c_ = int(c2 * e)
         self.cv1 = Conv(c1, c_, k[0], 1)
         self.cv2 = Conv(c_, c2, k[1], 1, g=g)
         self.add = shortcut and c1 == c2
         self.LCAM = LCAM(c2)
         
-    def forward(self, x):
-        """Apply bottleneck with optional shortcut connection."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies convolution followed by LCAM and an optional shortcut connection."""
         conv_output = self.cv2(self.cv1(x))
-        lcam_output = self.LCAM(conv_output)
-        refined_output = conv_output * lcam_output
+        refined_output = conv_output * self.LCAM(conv_output)
         
-        # Optional shortcut connection
-        if self.add:
-            return x + refined_output
-        else:
-            return refined_output
+        return x + refined_output if self.add else refined_output
 
 
 class BottleneckCSP(nn.Module):
@@ -1175,20 +1170,20 @@ class C3k2(C2f):
         )
         
 class C3k2LCAM(C2fLCAM):
-    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+    """Faster Implementation of CSP Bottleneck augmented with LCAM via C3kLCAM or BottleneckLCAM."""
 
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+    def __init__(self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True) -> None:
         """
-        Initialize C3k2 module.
+        Initializes the C3k2 module augmented with LCAM.
 
         Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of blocks.
-            c3k (bool): Whether to use C3k blocks.
-            e (float): Expansion ratio.
-            g (int): Groups for convolutions.
-            shortcut (bool): Whether to use shortcut connections.
+            c1 (int): Input channel dimensionality.
+            c2 (int): Output channel dimensionality.
+            n (int, optional): Number of Bottleneck blocks. Defaults to 1.
+            c3k (bool, optional): Whether to use C3k blocks instead of Bottleneck. Defaults to False.
+            e (float, optional): Expansion ratio for hidden channels. Defaults to 0.5.
+            g (int, optional): Number of groups for convolutions. Defaults to 1.
+            shortcut (bool, optional): Whether to use shortcut connections. Defaults to True.
         """
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(
@@ -1196,64 +1191,43 @@ class C3k2LCAM(C2fLCAM):
         )
 
 
-# In block.py
-
 class C3k2SimAM(C3k2):
     """
-    Modification of C3k2 (based on C2f) that applies SimAM attention
-    after each internal Bottleneck/C3k block (Option 1).
+    Modification of C3k2 that applies SimAM attention after each internal bottleneck block.
     """
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True, simam_lambda=1e-4):
+    def __init__(self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True, simam_lambda: float = 1e-4) -> None:
         """
-        Initialize C3k2SimAM module.
+        Initializes the C3k2SimAM module.
 
         Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of blocks.
-            c3k (bool): Whether to use C3k blocks instead of Bottleneck.
-            e (float): Expansion ratio.
-            g (int): Groups for convolutions.
-            shortcut (bool): Whether to use shortcut connections in internal blocks.
-            simam_lambda (float): Lambda parameter for the SimAM module.
+            c1 (int): Input channel dimensionality.
+            c2 (int): Output channel dimensionality.
+            n (int, optional): Number of blocks. Defaults to 1.
+            c3k (bool, optional): Whether to use C3k blocks instead of Bottleneck. Defaults to False.
+            e (float, optional): Expansion ratio. Defaults to 0.5.
+            g (int, optional): Channels grouping for convolution. Defaults to 1.
+            shortcut (bool, optional): Whether to use shortcut connections. Defaults to True.
+            simam_lambda (float, optional): Regularization lambda for the SimAM module. Defaults to 1e-4.
         """
-        # Run parent initializers first (sets self.c, self.cv1, self.m, and the *original* self.cv2)
         super().__init__(c1, c2, n, c3k, e, g, shortcut)
 
-        # Instantiate SimAM
         self.simam = SimAM(self.c, self.c, e_lambda=simam_lambda)
-
-        # --- ADD THIS LINE ---
-        # Re-initialize self.cv2 to expect the correct number of input channels
-        # based on the modified forward pass concatenation: (1 + n) * self.c
+        
+        # Override the final convolution channel shape for the combined features
         self.cv2 = Conv((1 + n) * self.c, c2, 1)
-        # --- END ADDED LINE ---
 
-    def forward(self, x):
-        """
-        Forward pass through C3k2SimAM layer, applying SimAM after each block in self.m.
-        This overrides the forward method inherited from C2f/C3k2.
-        """
-        # Initial conv and split
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass applying SimAM after each block."""
         y = list(self.cv1(x).split((self.c, self.c), 1))
-
-        # Store the initial shortcut path
         shortcut_path = y[0]
 
-        # Process the second path through blocks and SimAM
         current_feature = y[1]
         processed_features = []
         for block in self.m:
-            block_output = block(current_feature)
-            simam_output = self.simam(block_output)
-            processed_features.append(simam_output)
-            current_feature = simam_output # Update feature for next block
+            current_feature = self.simam(block(current_feature))
+            processed_features.append(current_feature)
 
-        # Combine shortcut path and processed features
-        y_combined = [shortcut_path] + processed_features
-
-        # Final convolution (now correctly initialized)
-        return self.cv2(torch.cat(y_combined, 1))
+        return self.cv2(torch.cat([shortcut_path] + processed_features, 1))
 
 
 

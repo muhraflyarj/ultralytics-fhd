@@ -1350,68 +1350,92 @@ class Exporter:
         return f, None
 
     def _add_tflite_metadata(self, file):
-        """Add metadata to *.tflite models per https://www.tensorflow.org/lite/models/convert/metadata."""
-        import flatbuffers
+        """Add metadata to *.tflite models."""
+        from ultralytics.utils import LOGGER, colorstr
 
         try:
-            # TFLite Support bug https://github.com/tensorflow/tflite-support/issues/954#issuecomment-2108570845
-            from tensorflow_lite_support.metadata import metadata_schema_py_generated as schema  # noqa
-            from tensorflow_lite_support.metadata.python import metadata  # noqa
-        except ImportError:  # ARM64 systems may not have the 'tensorflow_lite_support' package available
-            from tflite_support import metadata  # noqa
-            from tflite_support import metadata_schema_py_generated as schema  # noqa
+            import flatbuffers
+        except ImportError:
+            LOGGER.warning(f"{colorstr('TFLite:')} flatbuffers not found. Skipping metadata population.")
+            return
 
-        # Create model info
-        model_meta = schema.ModelMetadataT()
-        model_meta.name = self.metadata["description"]
-        model_meta.version = self.metadata["version"]
-        model_meta.author = self.metadata["author"]
-        model_meta.license = self.metadata["license"]
+        try:
+            try:
+                from tensorflow_lite_support.metadata import metadata_schema_py_generated as schema
+                from tensorflow_lite_support.metadata.python import metadata
+            except ImportError:
+                from tflite_support import metadata
+                from tflite_support import metadata_schema_py_generated as schema
+        except ImportError:
+            LOGGER.warning(f"{colorstr('TFLite:')} tflite_support not installed. "
+                           f"Model {file} is functional but will not contain embedded metadata.")
+            return
 
-        # Label file
-        tmp_file = Path(file).parent / "temp_meta.txt"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            f.write(str(self.metadata))
+        try:
+            model_meta = schema.ModelMetadataT()
+            model_meta.name = str(self.metadata.get("description", "YOLO11-LCA Optimized Model"))
+            model_meta.version = str(self.metadata.get("version", "1.0.0"))
+            model_meta.author = str(self.metadata.get("author", "Rafly Arjasubrata"))
+            model_meta.license = str(self.metadata.get("license", "AGPL-3.0"))
 
-        label_file = schema.AssociatedFileT()
-        label_file.name = tmp_file.name
-        label_file.type = schema.AssociatedFileType.TENSOR_AXIS_LABELS
+            tmp_file = Path(file).parent / "temp_meta.txt"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                f.write(str(self.metadata.get("names", {})))
 
-        # Create input info
-        input_meta = schema.TensorMetadataT()
-        input_meta.name = "image"
-        input_meta.description = "Input image to be detected."
-        input_meta.content = schema.ContentT()
-        input_meta.content.contentProperties = schema.ImagePropertiesT()
-        input_meta.content.contentProperties.colorSpace = schema.ColorSpaceType.RGB
-        input_meta.content.contentPropertiesType = schema.ContentProperties.ImageProperties
+            label_file = schema.AssociatedFileT()
+            label_file.name = tmp_file.name
+            label_file.type = schema.AssociatedFileType.TENSOR_AXIS_LABELS
 
-        # Create output info
-        output1 = schema.TensorMetadataT()
-        output1.name = "output"
-        output1.description = "Coordinates of detected objects, class labels, and confidence score"
-        output1.associatedFiles = [label_file]
-        if self.model.task == "segment":
-            output2 = schema.TensorMetadataT()
-            output2.name = "output"
-            output2.description = "Mask protos"
-            output2.associatedFiles = [label_file]
+            input_meta = schema.TensorMetadataT()
+            input_meta.name = "image"
+            input_meta.description = f"Input image ({self.imgsz}x{self.imgsz})"
+            input_meta.content = schema.ContentT()
+            input_meta.content.contentProperties = schema.ImagePropertiesT()
+            input_meta.content.contentProperties.colorSpace = schema.ColorSpaceType.RGB
+            input_meta.content.contentPropertiesType = schema.ContentProperties.ImageProperties
+            
+            input_stats = schema.ProcessUnitT()
+            input_stats.optionsType = schema.ProcessUnitOptions.NormalizationOptions
+            input_stats.options = schema.NormalizationOptionsT()
+            input_stats.options.mean = [0.0]
+            input_stats.options.std = [255.0]
+            input_meta.processUnits = [input_stats]
 
-        # Create subgraph info
-        subgraph = schema.SubGraphMetadataT()
-        subgraph.inputTensorMetadata = [input_meta]
-        subgraph.outputTensorMetadata = [output1, output2] if self.model.task == "segment" else [output1]
-        model_meta.subgraphMetadata = [subgraph]
+            output1 = schema.TensorMetadataT()
+            output1.name = "detection_boxes"
+            output1.description = "Boxes, scores, and class IDs"
+            output1.associatedFiles = [label_file]
+            
+            subgraph = schema.SubGraphMetadataT()
+            subgraph.inputTensorMetadata = [input_meta]
+            
+            if self.model.task == "segment":
+                output2 = schema.TensorMetadataT()
+                output2.name = "masks"
+                output2.description = "Mask protos for segmentation"
+                subgraph.outputTensorMetadata = [output1, output2]
+            else:
+                subgraph.outputTensorMetadata = [output1]
 
-        b = flatbuffers.Builder(0)
-        b.Finish(model_meta.Pack(b), metadata.MetadataPopulator.METADATA_FILE_IDENTIFIER)
-        metadata_buf = b.Output()
+            model_meta.subgraphMetadata = [subgraph]
 
-        populator = metadata.MetadataPopulator.with_model_file(str(file))
-        populator.load_metadata_buffer(metadata_buf)
-        populator.load_associated_files([str(tmp_file)])
-        populator.populate()
-        tmp_file.unlink()
+            b = flatbuffers.Builder(0)
+            b.Finish(model_meta.Pack(b), metadata.MetadataPopulator.METADATA_FILE_IDENTIFIER)
+            
+            populator = metadata.MetadataPopulator.with_model_file(str(file))
+            populator.load_metadata_buffer(b.Output())
+            populator.load_associated_files([str(tmp_file)])
+            populator.populate()
+
+            if tmp_file.exists():
+                tmp_file.unlink()
+            
+            LOGGER.info(f"{colorstr('TFLite:')} Metadata successfully populated for {file}")
+
+        except Exception as e:
+            LOGGER.error(f"{colorstr('TFLite:')} Metadata population failed: {e}")
+            if 'tmp_file' in locals() and tmp_file.exists():
+                tmp_file.unlink()
 
     def _pipeline_coreml(self, model, weights_dir=None, prefix=colorstr("CoreML Pipeline:")):
         """YOLO CoreML pipeline."""

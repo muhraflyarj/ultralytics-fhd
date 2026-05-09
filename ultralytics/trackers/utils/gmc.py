@@ -331,8 +331,12 @@ class GMC:
         # Find the keypoints
         keypoints = cv2.goodFeaturesToTrack(frame, mask=None, **self.feature_params)
 
-        # Handle first frame
-        if not self.initializedFirstFrame or self.prevKeyPoints is None:
+        # Handle first frame or dimension mismatch
+        if (
+            not self.initializedFirstFrame
+            or self.prevKeyPoints is None
+            or self.prevFrame.shape[:2] != frame.shape[:2]
+        ):
             self.prevFrame = frame.copy()
             self.prevKeyPoints = copy.copy(keypoints)
             self.initializedFirstFrame = True

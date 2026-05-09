@@ -6,6 +6,7 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+from typing import Optional, Set, Tuple
 
 import torch
 
@@ -70,7 +71,7 @@ from ultralytics.nn.modules import (
     LCBHAM,
     C3k2SimAM
 )
-from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
+from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, ROOT, SETTINGS, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2EDetectLoss,
@@ -904,6 +905,111 @@ class SafeUnpickler(pickle.Unpickler):
             return SafeClass
 
 
+def _parse_custom_yolo11_pt(weight: str) -> Optional[Tuple[str, str]]:
+    name = Path(weight).name
+    match = re.match(r"^yolo11([nslmx])-(.+)\.pt$", name)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _resolve_custom_yolo11_yaml(scale: str, suffix: str) -> Optional[Path]:
+    cfg_dir = ROOT / "cfg" / "models" / "11"
+    sized = cfg_dir / f"yolo11{scale}-{suffix}.yaml"
+    if sized.exists():
+        return sized
+    unsized = cfg_dir / f"yolo11-{suffix}.yaml"
+    if unsized.exists():
+        return unsized
+    return None
+
+
+def _map_lcbham_key(target_key: str, lcbham_layers: set[int]) -> str:
+    parts = target_key.split(".")
+    if len(parts) < 3:
+        return target_key
+    layer_idx = parts[1]
+    if layer_idx.isdigit() and int(layer_idx) in lcbham_layers:
+        if ".conv_block.0." in target_key:
+            return target_key.replace("conv_block.0.", "conv.")
+        if ".conv_block.1." in target_key:
+            return target_key.replace("conv_block.1.", "bn.")
+    return target_key
+
+
+def _find_lcbham_layers(model: "DetectionModel") -> Set[int]:
+    return {i for i, m in enumerate(model.model) if isinstance(m, LCBHAM)}
+
+
+def _create_custom_yolo11_ckpt(weight: str, output_path: Path) -> Optional[Tuple[Path, bool]]:
+    parsed = _parse_custom_yolo11_pt(weight)
+    if not parsed:
+        return None
+
+    scale, suffix = parsed
+    yaml_path = _resolve_custom_yolo11_yaml(scale, suffix)
+    if not yaml_path:
+        LOGGER.warning(f"WARNING ⚠️ Custom YAML not found for '{weight}', expected yolo11-{suffix}.yaml")
+        return None
+
+    from ultralytics.utils.downloads import attempt_download_asset
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_dict = yaml_load(yaml_path)
+    cfg_dict["scale"] = scale
+    cfg_dict["yaml_file"] = str(yaml_path)
+    target_model = DetectionModel(cfg=cfg_dict, ch=3, nc=80, verbose=False)
+    target_state = target_model.state_dict()
+    base_path = Path(attempt_download_asset(f"yolo11{scale}.pt"))
+
+    transferred = 0
+    if base_path.exists():
+        ckpt = torch.load(base_path, map_location="cpu")
+        if isinstance(ckpt, dict):
+            base_obj = ckpt.get("ema") or ckpt.get("model") or ckpt
+        else:
+            base_obj = ckpt
+
+        if hasattr(base_obj, "state_dict"):
+            source_state = base_obj.float().state_dict()
+        elif isinstance(base_obj, dict):
+            source_state = base_obj
+        else:
+            source_state = {}
+
+        lcbham_layers = _find_lcbham_layers(target_model)
+        new_state = {}
+        for t_key, t_tensor in target_state.items():
+            s_key = _map_lcbham_key(t_key, lcbham_layers)
+            s_tensor = source_state.get(s_key)
+            if s_tensor is not None and s_tensor.shape == t_tensor.shape:
+                new_state[t_key] = s_tensor
+                transferred += 1
+            else:
+                new_state[t_key] = t_tensor
+
+        target_model.load_state_dict(new_state, strict=False)
+        LOGGER.info(
+            f"Transferred {transferred}/{len(target_state)} items from yolo11{scale}.pt to custom '{yaml_path.name}'"
+        )
+    else:
+        LOGGER.warning(f"WARNING ⚠️ Base weights yolo11{scale}.pt not found; using random init for {yaml_path.name}")
+
+    torch.save(
+        {
+            "epoch": -1,
+            "best_fitness": None,
+            "model": target_model,
+            "ema": None,
+            "updates": None,
+            "train_args": {"model": str(yaml_path)},
+            "date": None,
+        },
+        output_path,
+    )
+    return output_path, True
+
+
 def torch_safe_load(weight, safe_only=False):
     """
     Attempts to load a PyTorch model with the torch.load() function. If a ModuleNotFoundError is raised, it catches the
@@ -926,6 +1032,12 @@ def torch_safe_load(weight, safe_only=False):
 
     check_suffix(file=weight, suffix=".pt")
     file = attempt_download_asset(weight)  # search online if missing locally
+    cleanup_temp = False
+    if not Path(file).exists():
+        custom_path = SETTINGS["weights_dir"] / Path(Path(file).name)
+        created = _create_custom_yolo11_ckpt(weight, custom_path)
+        if created:
+            file, cleanup_temp = created
     try:
         with temporary_modules(
             modules={
@@ -968,6 +1080,12 @@ def torch_safe_load(weight, safe_only=False):
         )
         check_requirements(e.name)  # install missing module
         ckpt = torch.load(file, map_location="cpu")
+    finally:
+        if cleanup_temp:
+            try:
+                Path(file).unlink()
+            except OSError:
+                pass
 
     if not isinstance(ckpt, dict):
         # File is likely a YOLO instance saved with i.e. torch.save(model, "saved_model.pt")
